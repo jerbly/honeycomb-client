@@ -144,26 +144,9 @@ impl HoneyComb {
         }
     }
 
-    pub async fn get_exists_query_url(
-        &self,
-        dataset_slug: &str,
-        column_id: &str,
-    ) -> anyhow::Result<String> {
+    async fn get_query_url(&self, dataset_slug: &str, json: Value) -> anyhow::Result<String> {
         let query: Query = self
-            .post(
-                &format!("queries/{}", dataset_slug),
-                serde_json::json!({
-                    "breakdowns": [column_id],
-                    "calculations": [{
-                        "op": "COUNT"
-                    }],
-                    "filters": [{
-                        "column": column_id,
-                        "op": "exists",
-                    }],
-                    "time_range": 604800
-                }),
-            )
+            .post(&format!("queries/{}", dataset_slug), json)
             .await?;
 
         let query_result: QueryResult = self
@@ -178,6 +161,46 @@ impl HoneyComb {
             .await?;
 
         Ok(query_result.links.query_url)
+    }
+
+    pub async fn get_exists_query_url(
+        &self,
+        dataset_slug: &str,
+        column_id: &str,
+    ) -> anyhow::Result<String> {
+        self.get_query_url(
+            dataset_slug,
+            serde_json::json!({
+                "breakdowns": [column_id],
+                "calculations": [{
+                    "op": "COUNT"
+                }],
+                "filters": [{
+                    "column": column_id,
+                    "op": "exists",
+                }],
+                "time_range": 604800
+            }),
+        )
+        .await
+    }
+
+    pub async fn get_avg_query_url(
+        &self,
+        dataset_slug: &str,
+        column_id: &str,
+    ) -> anyhow::Result<String> {
+        self.get_query_url(
+            dataset_slug,
+            serde_json::json!({
+                "calculations": [{
+                    "op": "AVG",
+                    "column": column_id
+                }],
+                "time_range": 604800
+            }),
+        )
+        .await
     }
 
     /// Get a list of datasets that have been written to in the last `last_written` days
