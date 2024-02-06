@@ -179,7 +179,7 @@ impl HoneyComb {
                     "column": column_id,
                     "op": "exists",
                 }],
-                "time_range": 604800
+                "time_range": 604799
             }),
         )
         .await
@@ -197,7 +197,7 @@ impl HoneyComb {
                     "op": "AVG",
                     "column": column_id
                 }],
-                "time_range": 604800
+                "time_range": 604799
             }),
         )
         .await
