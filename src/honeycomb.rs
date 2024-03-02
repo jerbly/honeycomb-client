@@ -6,9 +6,11 @@ use std::{
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use futures::stream::{FuturesOrdered, StreamExt};
+use futures::stream::{self, FuturesOrdered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use tokio;
 
 #[derive(Debug, Clone)]
 pub struct HoneyComb {
@@ -102,12 +104,17 @@ impl HoneyComb {
             .header("X-Honeycomb-Team", &self.api_key)
             .send()
             .await?;
+        let headers = response.headers().clone();
+        let status = response.status();
         let text: String = response.text().await?;
 
         match serde_json::from_str::<T>(&text) {
             Ok(t) => Ok(t),
             Err(e) => {
-                eprintln!("Invalid JSON data: {}", text);
+                eprintln!(
+                    "Invalid response: GET request = {}, \nstatus = {:?}, \nJSON-data = {}, \nheaders = {:?}",
+                    request, status, text, headers
+                );
                 Err(anyhow::anyhow!("Failed to parse JSON data: {}", e))
             }
         }
@@ -122,29 +129,64 @@ impl HoneyComb {
     pub async fn list_all_columns(&self, dataset_slug: &str) -> anyhow::Result<Vec<Column>> {
         self.get(&format!("columns/{}", dataset_slug)).await
     }
+    pub async fn get_query_results(
+        &self,
+        dataset_slug: &str,
+        query_result_id: &str,
+    ) -> anyhow::Result<Value> {
+        self.get(&format!(
+            "query_results/{}/{}",
+            dataset_slug, query_result_id
+        ))
+        .await
+    }
 
     async fn post<T>(&self, request: &str, json: Value) -> anyhow::Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = reqwest::Client::new()
-            .post(format!("{}{}", URL, request))
-            .header("X-Honeycomb-Team", &self.api_key)
-            .json(&json)
-            .send()
-            .await?;
-        let text: String = response.text().await?;
+        let mut retries = 12;
+        while retries > 0 {
+            let response = reqwest::Client::new()
+                .post(format!("{}{}", URL, request))
+                .header("X-Honeycomb-Team", &self.api_key)
+                .json(&json)
+                .send()
+                .await?;
+            let status = response.status();
 
-        match serde_json::from_str::<T>(&text) {
-            Ok(t) => Ok(t),
-            Err(e) => {
-                eprintln!("Invalid JSON data: {}", text);
-                Err(anyhow::anyhow!("Failed to parse JSON data: {}", e))
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                eprintln!(
+                    "Too many requests, retrying in 5 seconds - retries left: {}",
+                    retries
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                retries -= 1;
+                continue;
             }
+            let headers = response.headers().clone();
+            let text: String = response.text().await?;
+
+            return match serde_json::from_str::<T>(&text) {
+                Ok(t) => Ok(t),
+                Err(e) => {
+                    eprintln!(
+                        "Invalid response: POST request = {}, \nstatus = {:?}, \nJSON-data = {}, \nheaders = {:?}",
+                        request, status, text, headers
+                    );
+                    Err(anyhow::anyhow!("Failed to parse JSON data: {}", e))
+                }
+            };
         }
+        Err(anyhow::anyhow!("Too many retries"))
     }
 
-    async fn get_query_url(&self, dataset_slug: &str, json: Value) -> anyhow::Result<String> {
+    async fn get_query_url(
+        &self,
+        dataset_slug: &str,
+        json: Value,
+        disable_series: bool,
+    ) -> anyhow::Result<String> {
         let query: Query = self
             .post(&format!("queries/{}", dataset_slug), json)
             .await?;
@@ -154,7 +196,7 @@ impl HoneyComb {
                 &format!("query_results/{}", dataset_slug),
                 serde_json::json!({
                   "query_id": query.id,
-                  "disable_series": false,
+                  "disable_series": disable_series,
                   "limit": 10000
                 }),
             )
@@ -167,6 +209,7 @@ impl HoneyComb {
         &self,
         dataset_slug: &str,
         column_id: &str,
+        disable_series: bool,
     ) -> anyhow::Result<String> {
         self.get_query_url(
             dataset_slug,
@@ -181,6 +224,7 @@ impl HoneyComb {
                 }],
                 "time_range": 604799
             }),
+            disable_series,
         )
         .await
     }
@@ -199,8 +243,46 @@ impl HoneyComb {
                 }],
                 "time_range": 604799
             }),
+            false,
         )
         .await
+    }
+
+    pub async fn get_group_by_variants(
+        &self,
+        dataset_slug: &str,
+        column_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let url = self
+            .get_query_url(
+                dataset_slug,
+                serde_json::json!({
+                    "breakdowns": [column_id],
+                    "calculations": [{
+                        "op": "COUNT"
+                    }],
+                    "time_range": 604799
+                }),
+                false,
+            )
+            .await?;
+        let token = url.split('/').last().unwrap();
+        let mut results = Vec::new();
+        let mut polls = 50; // ~5 seconds
+        while polls > 0 {
+            let value = self.get_query_results(dataset_slug, token).await?;
+            if value["complete"].as_bool().unwrap() {
+                for r in value["data"]["results"].as_array().unwrap_or(&vec![]) {
+                    if let Some(column) = r["data"][column_id].as_str() {
+                        results.push(column.to_string());
+                    }
+                }
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            polls -= 1;
+        }
+        Ok(results)
     }
 
     /// Get a list of datasets that have been written to in the last `last_written` days
@@ -281,5 +363,26 @@ impl HoneyComb {
         }
 
         Ok(())
+    }
+
+    pub async fn get_all_group_by_variants(
+        &self,
+        dataset_slug: &str,
+        columns_ids: &[String],
+    ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+        Ok(stream::iter(columns_ids.iter().cloned())
+            .map(|column_id| async {
+                let variants = self.get_group_by_variants(dataset_slug, &column_id).await;
+                match variants {
+                    Ok(variants) => (column_id, variants),
+                    Err(e) => {
+                        eprintln!("error fetching variants for column {}: {}", column_id, e);
+                        (column_id, vec![])
+                    }
+                }
+            })
+            .buffer_unordered(3)
+            .collect::<Vec<_>>()
+            .await)
     }
 }
