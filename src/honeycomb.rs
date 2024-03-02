@@ -7,9 +7,9 @@ use std::{
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, FuturesOrdered, StreamExt};
+use indicatif::ProgressBar;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
 use tokio;
 
 #[derive(Debug, Clone)]
@@ -156,10 +156,6 @@ impl HoneyComb {
             let status = response.status();
 
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                eprintln!(
-                    "Too many requests, retrying in 5 seconds - retries left: {}",
-                    retries
-                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 retries -= 1;
                 continue;
@@ -370,7 +366,16 @@ impl HoneyComb {
         dataset_slug: &str,
         columns_ids: &[String],
     ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
-        Ok(stream::iter(columns_ids.iter().cloned())
+        let bar = ProgressBar::new(columns_ids.len() as u64)
+            .with_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                    .unwrap(),
+            )
+            .with_message("Rate-limited queries, please wait...");
+        bar.inc(0);
+
+        let mut tasks = stream::iter(columns_ids.iter().cloned())
             .map(|column_id| async {
                 let variants = self.get_group_by_variants(dataset_slug, &column_id).await;
                 match variants {
@@ -381,8 +386,15 @@ impl HoneyComb {
                     }
                 }
             })
-            .buffer_unordered(3)
-            .collect::<Vec<_>>()
-            .await)
+            .buffer_unordered(3);
+
+        let mut results = Vec::new();
+        while let Some(result) = tasks.next().await {
+            bar.inc(1);
+            results.push(result);
+        }
+        bar.finish_and_clear();
+
+        Ok(results)
     }
 }
