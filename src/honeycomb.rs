@@ -50,6 +50,12 @@ struct Query {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct Status {
+    pub status: usize,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct NameAndSlug {
     pub name: String,
@@ -175,6 +181,14 @@ impl HoneyComb {
             };
         }
         Err(anyhow::anyhow!("Too many retries"))
+    }
+
+    pub async fn create_events(
+        &self,
+        dataset_slug: &str,
+        json: Value,
+    ) -> anyhow::Result<Vec<Status>> {
+        self.post(&format!("batch/{}/", dataset_slug), json).await
     }
 
     async fn get_query_url(
