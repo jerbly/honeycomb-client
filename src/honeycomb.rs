@@ -262,6 +262,7 @@ impl HoneyComb {
         &self,
         dataset_slug: &str,
         column_id: &str,
+        range_seconds: usize,
     ) -> anyhow::Result<Vec<String>> {
         let url = self
             .get_query_url(
@@ -271,17 +272,20 @@ impl HoneyComb {
                     "calculations": [{
                         "op": "COUNT"
                     }],
-                    "time_range": 604799
+                    "time_range": 604799.min(range_seconds)
                 }),
                 false,
             )
             .await?;
-        let token = url.split('/').last().unwrap();
+        let token = url.split('/').last().context("Invalid query URL")?;
         let mut results = Vec::new();
         let mut polls = 50; // ~5 seconds
         while polls > 0 {
             let value = self.get_query_results(dataset_slug, token).await?;
-            if value["complete"].as_bool().unwrap() {
+            if value["complete"]
+                .as_bool()
+                .context("Missing 'complete' field")?
+            {
                 for r in value["data"]["results"].as_array().unwrap_or(&vec![]) {
                     if let Some(column) = r["data"][column_id].as_str() {
                         results.push(column.to_string());
@@ -301,11 +305,7 @@ impl HoneyComb {
         last_written: i64,
         include_datasets: Option<HashSet<String>>,
     ) -> anyhow::Result<Vec<String>> {
-        let inc_datasets = match include_datasets {
-            Some(d) => d,
-            None => HashSet::new(),
-        };
-
+        let inc_datasets = include_datasets.unwrap_or_default();
         let now = Utc::now();
         let mut datasets = self
             .list_all_datasets()
@@ -379,19 +379,21 @@ impl HoneyComb {
         &self,
         dataset_slug: &str,
         columns_ids: &[String],
+        range_seconds: usize,
     ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
         let bar = ProgressBar::new(columns_ids.len() as u64)
             .with_style(
                 indicatif::ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                    .unwrap(),
+                    .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")?,
             )
             .with_message("Rate-limited queries, please wait...");
         bar.inc(0);
 
         let mut tasks = stream::iter(columns_ids.iter().cloned())
             .map(|column_id| async {
-                let variants = self.get_group_by_variants(dataset_slug, &column_id).await;
+                let variants = self
+                    .get_group_by_variants(dataset_slug, &column_id, range_seconds)
+                    .await;
                 match variants {
                     Ok(variants) => (column_id, variants),
                     Err(e) => {
